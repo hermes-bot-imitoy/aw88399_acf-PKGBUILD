@@ -1,0 +1,78 @@
+name: Build aw88399 ACF Package
+
+on:
+  push:
+    branches: [ "main", "bot" ]
+    paths:
+      - 'PKGBUILD'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    container:
+      image: archlinux:latest
+      options: --privileged
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize System & Dependencies
+        run: |
+          pacman -Syu --noconfirm base-devel git
+          # 安装 gh CLI:用于触发 GitHub Pages 部署仓库更新
+          pacman -S --noconfirm github-cli
+          useradd builder -m
+          passwd -d builder
+          printf 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder:builder .
+
+      - name: Build Package
+        run: |
+          sudo -u builder makepkg -sc --noconfirm
+
+      - name: Extract version from PKGBUILD
+        id: get_version
+        run: |
+          source ./PKGBUILD
+          echo "VERSION=${pkgver}-${pkgrel}" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version.outputs.VERSION }}
+          files: |
+            *.pkg.tar.zst
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trigger GitHub Pages pacman repo update
+        env:
+          GH_TOKEN: ${{ secrets.PACMAN_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 部署仓库:GitHub Pages 上的 pacman 仓库(不存在则自动创建同名仓库)
+          PAGES_REPO="linux-legion-audio-fix"
+          if ! gh repo view "imitoy/${PAGES_REPO}" >/dev/null 2>&1; then
+            echo "==> 部署仓库不存在,创建 ${PAGES_REPO} 并初始化部署 workflow"
+            gh repo create "imitoy/${PAGES_REPO}" --public --confirm
+            # 将部署 workflow 推送到新仓库(从本仓库的模板复制)
+            git clone "https://github.com/imitoy/${PAGES_REPO}.git" pages-repo
+            cd pages-repo
+            mkdir -p .github/workflows
+            cp "${GITHUB_WORKSPACE}/.github/pages-deploy.yml" .github/workflows/deploy.yml
+            git add -A
+            git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "ci: init pacman repo deploy workflow" || true
+            git push origin main || true
+            cd .. && rm -rf pages-repo
+            # 启用 GitHub Pages(Actions 部署模式)
+            gh api "repos/imitoy/${PAGES_REPO}/pages" -X PUT -f "build_type=workflow" || true
+          fi
+          echo "==> 触发 ${PAGES_REPO} 部署(拉取最新 Release 资产并发布到 Pages)"
+          gh api "repos/imitoy/${PAGES_REPO}/dispatches" -X POST \
+            -f "event_type=update-packages" || true
+          echo "==> 已触发: https://github.com/imitoy/${PAGES_REPO}/actions"
